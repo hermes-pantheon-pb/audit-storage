@@ -1310,6 +1310,247 @@ class StorageAuditor:
             "scan_warnings_and_errors": self.scan_errors,
         }
 
+    def export_separate_reports(self, output_dir: str) -> Dict[str, Any]:
+        """
+        Exports separate, dedicated diagnostic report files for each anomaly flag category.
+        Generates both structured JSON (.json) and clean, shell-friendly plaintext (.txt)
+        files in the specified output directory.
+        """
+        out_path = Path(output_dir).expanduser().resolve()
+        out_path.mkdir(parents=True, exist_ok=True)
+        manifest: Dict[str, Any] = {
+            "output_directory": str(out_path),
+            "files": {},
+        }
+
+        # 1. Summary
+        summary_data = {
+            "metadata": {
+                "tool": TOOL_NAME,
+                "version": TOOL_VERSION,
+                "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "downloads_path": self.downloads_dir,
+                "library_paths": self.library_dirs,
+                "exclude_downloads": self.exclude_downloads,
+                "skipped_download_dirs": self.skipped_download_dirs,
+                "payload_threshold_bytes": self.payload_threshold,
+            },
+            "summary": {
+                "total_files_scanned": self.total_scanned_files,
+                "total_bytes_scanned": self.total_scanned_bytes,
+                "total_size_human": format_bytes(self.total_scanned_bytes),
+                "downloads_file_count": self.downloads_file_count,
+                "downloads_total_bytes": self.downloads_total_bytes,
+                "downloads_size_human": format_bytes(self.downloads_total_bytes),
+                "skipped_download_dirs_count": len(self.skipped_download_dirs),
+                "library_file_count": self.library_file_count,
+                "library_total_bytes": self.library_total_bytes,
+                "library_size_human": format_bytes(self.library_total_bytes),
+                "counts": {
+                    "orphaned_staging_files": len(self.orphan_staging_files),
+                    "ghost_links": len(self.ghost_links),
+                    "over_linked_unique_inodes": len(self.over_linked_groups),
+                    "over_linked_total_paths": len(self.over_linked_files),
+                    "normal_active_hardlinks": self.normal_hardlinks_count,
+                    "ghost_directories": len(self.ghost_directories),
+                    "tv_sequence_gaps": len(self.tv_gaps),
+                    "music_album_gaps": len(self.music_gaps),
+                    "dataset_inconsistencies": len(self.dataset_inconsistencies),
+                },
+            },
+            "mergerfs_device_audit": asdict(self.get_mergerfs_report()),
+            "scan_errors": self.scan_errors,
+        }
+        f_sum_json = out_path / "audit_summary.json"
+        with open(f_sum_json, "w", encoding="utf-8") as f:
+            json.dump(summary_data, f, indent=2)
+
+        f_sum_txt = out_path / "audit_summary.txt"
+        with open(f_sum_txt, "w", encoding="utf-8") as f:
+            f.write(f"STORAGE POOL & HARDLINK INVARIANT AUDIT SUMMARY v{TOOL_VERSION}\n")
+            f.write(f"Timestamp UTC: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
+            f.write(f"Downloads:     {self.downloads_dir}\n")
+            for idx, lib in enumerate(self.library_dirs, 1):
+                f.write(f"Library #{idx}:   {lib}\n")
+            if self.exclude_downloads:
+                f.write(f"Excluded:      {', '.join(self.exclude_downloads)} ({len(self.skipped_download_dirs)} pruned)\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Total Files Audited:      {self.total_scanned_files} ({format_bytes(self.total_scanned_bytes)})\n")
+            f.write(f"Downloads Staging Files:  {self.downloads_file_count} ({format_bytes(self.downloads_total_bytes)})\n")
+            f.write(f"Organized Library Files:  {self.library_file_count} ({format_bytes(self.library_total_bytes)})\n")
+            f.write(f"Active Normal Hardlinks:  {self.normal_hardlinks_count} ({format_bytes(self.normal_hardlinks_bytes)})\n")
+            f.write(f"Orphan Staging Files:     {len(self.orphan_staging_files)}\n")
+            f.write(f"Ghost Links (Copies):     {len(self.ghost_links)}\n")
+            f.write(f"Over-Linked Inodes:       {len(self.over_linked_groups)} ({len(self.over_linked_files)} paths)\n")
+            f.write(f"Ghost Directories:        {len(self.ghost_directories)}\n")
+            f.write(f"TV Sequence Gaps:         {len(self.tv_gaps)}\n")
+            f.write(f"Music Album Gaps:         {len(self.music_gaps)}\n")
+            f.write(f"Dataset Inconsistencies:  {len(self.dataset_inconsistencies)}\n")
+        manifest["files"]["summary"] = {"json": str(f_sum_json), "txt": str(f_sum_txt)}
+
+        # 2. Orphan Staging Files
+        orphans_json_data = [asdict(x) for x in self.orphan_staging_files]
+        f_orph_json = out_path / "orphaned_staging_files.json"
+        with open(f_orph_json, "w", encoding="utf-8") as f:
+            json.dump(orphans_json_data, f, indent=2)
+
+        f_orph_txt = out_path / "orphaned_staging_files.txt"
+        with open(f_orph_txt, "w", encoding="utf-8") as f:
+            for x in self.orphan_staging_files:
+                f.write(f"{x.path}\n")
+        manifest["files"]["orphaned_staging_files"] = {
+            "count": len(self.orphan_staging_files),
+            "json": str(f_orph_json),
+            "txt": str(f_orph_txt),
+        }
+
+        # 3. Ghost Links (copies instead of hardlinks)
+        ghost_json_data = [asdict(x) for x in self.ghost_links]
+        f_ghost_json = out_path / "ghost_links.json"
+        with open(f_ghost_json, "w", encoding="utf-8") as f:
+            json.dump(ghost_json_data, f, indent=2)
+
+        f_ghost_txt = out_path / "ghost_links.txt"
+        with open(f_ghost_txt, "w", encoding="utf-8") as f:
+            for x in self.ghost_links:
+                counterpart = x.counterpart_paths[0] if x.counterpart_paths else "UNKNOWN"
+                f.write(f"{x.path}\t{counterpart}\t{x.size_human}\n")
+        manifest["files"]["ghost_links"] = {
+            "count": len(self.ghost_links),
+            "json": str(f_ghost_json),
+            "txt": str(f_ghost_txt),
+        }
+
+        # 4. Over-Linked Files
+        overlink_data = {
+            "inference": asdict(self.overlink_inference) if self.overlink_inference else None,
+            "unique_inodes_count": len(self.over_linked_groups),
+            "total_paths_count": len(self.over_linked_files),
+            "groups": [asdict(g) for g in self.over_linked_groups],
+            "files": [asdict(x) for x in self.over_linked_files],
+        }
+        f_over_json = out_path / "over_linked_files.json"
+        with open(f_over_json, "w", encoding="utf-8") as f:
+            json.dump(overlink_data, f, indent=2)
+
+        f_over_txt = out_path / "over_linked_files.txt"
+        with open(f_over_txt, "w", encoding="utf-8") as f:
+            if self.overlink_inference:
+                causes_str = ", ".join(f"{k}: {v}" for k, v in self.overlink_inference.cause_breakdown.items())
+                f.write(f"# CAUSE BREAKDOWN: {causes_str}\n")
+                if self.overlink_inference.top_cross_seed_folders:
+                    f.write("# TOP CROSS-SEED FOLDERS:\n")
+                    for pair in self.overlink_inference.top_cross_seed_folders[:5]:
+                        f.write(f"#   - {pair['folders']}: {pair['count']} shared files\n")
+                f.write("\n")
+            for g in self.over_linked_groups:
+                f.write(f"# Inode {g.ino} (dev={g.dev}, nlink={g.st_nlink}, size={format_bytes(g.size)}, cause={g.inferred_cause})\n")
+                if g.downloads_paths:
+                    f.write("  Downloads:\n")
+                    for p in g.downloads_paths:
+                        f.write(f"    {p}\n")
+                if g.library_paths:
+                    f.write("  Libraries:\n")
+                    for p in g.library_paths:
+                        f.write(f"    {p}\n")
+                if g.external_count > 0:
+                    f.write(f"  External (outside audit paths): {g.external_count} hardlinks\n")
+                f.write("\n")
+        manifest["files"]["over_linked_files"] = {
+            "unique_inodes": len(self.over_linked_groups),
+            "total_paths": len(self.over_linked_files),
+            "json": str(f_over_json),
+            "txt": str(f_over_txt),
+        }
+
+        # 5. Ghost Directories
+        ghost_dirs_data = [asdict(x) for x in self.ghost_directories]
+        f_gdir_json = out_path / "ghost_directories.json"
+        with open(f_gdir_json, "w", encoding="utf-8") as f:
+            json.dump(ghost_dirs_data, f, indent=2)
+
+        f_gdir_txt = out_path / "ghost_directories.txt"
+        with open(f_gdir_txt, "w", encoding="utf-8") as f:
+            for x in self.ghost_directories:
+                f.write(f"{x.path}\n")
+        manifest["files"]["ghost_directories"] = {
+            "count": len(self.ghost_directories),
+            "json": str(f_gdir_json),
+            "txt": str(f_gdir_txt),
+        }
+
+        # 6. TV Sequence Gaps
+        tv_gaps_data = [asdict(x) for x in self.tv_gaps]
+        f_tv_json = out_path / "tv_sequence_gaps.json"
+        with open(f_tv_json, "w", encoding="utf-8") as f:
+            json.dump(tv_gaps_data, f, indent=2)
+
+        f_tv_txt = out_path / "tv_sequence_gaps.txt"
+        with open(f_tv_txt, "w", encoding="utf-8") as f:
+            for x in self.tv_gaps:
+                missing_str = ", ".join(f"E{e:02d}" for e in x.missing_episodes)
+                min_ep = min(x.present_episodes) if x.present_episodes else 0
+                max_ep = max(x.present_episodes) if x.present_episodes else 0
+                f.write(f"{x.series_name} / Season {x.season:02d} ({x.directory}) -> Missing: {missing_str} (Present {len(x.present_episodes)} eps: E{min_ep:02d}..E{max_ep:02d})\n")
+        manifest["files"]["tv_sequence_gaps"] = {
+            "count": len(self.tv_gaps),
+            "json": str(f_tv_json),
+            "txt": str(f_tv_txt),
+        }
+
+        # 7. Music Album Gaps
+        music_gaps_data = [asdict(x) for x in self.music_gaps]
+        f_music_json = out_path / "music_album_gaps.json"
+        with open(f_music_json, "w", encoding="utf-8") as f:
+            json.dump(music_gaps_data, f, indent=2)
+
+        f_music_txt = out_path / "music_album_gaps.txt"
+        with open(f_music_txt, "w", encoding="utf-8") as f:
+            for x in self.music_gaps:
+                missing_str = ", ".join(f"Track {t:02d}" for t in x.missing_tracks)
+                min_trk = min(x.present_tracks) if x.present_tracks else 0
+                max_trk = max(x.present_tracks) if x.present_tracks else 0
+                disc_str = f" [Disc {x.disc}]" if x.disc else ""
+                f.write(f"{x.album_name}{disc_str} ({x.directory}) -> Missing: {missing_str} (Present {len(x.present_tracks)} tracks: #{min_trk:02d}..#{max_trk:02d})\n")
+        manifest["files"]["music_album_gaps"] = {
+            "count": len(self.music_gaps),
+            "json": str(f_music_json),
+            "txt": str(f_music_txt),
+        }
+
+        # 8. Dataset Inconsistencies
+        dataset_data = [asdict(x) for x in self.dataset_inconsistencies]
+        f_ds_json = out_path / "dataset_inconsistencies.json"
+        with open(f_ds_json, "w", encoding="utf-8") as f:
+            json.dump(dataset_data, f, indent=2)
+
+        f_ds_txt = out_path / "dataset_inconsistencies.txt"
+        with open(f_ds_txt, "w", encoding="utf-8") as f:
+            for x in self.dataset_inconsistencies:
+                f.write(f"{x.dataset_name} ({x.directory})\t[{x.issue_type}]\t{x.details}\n")
+        manifest["files"]["dataset_inconsistencies"] = {
+            "count": len(self.dataset_inconsistencies),
+            "json": str(f_ds_json),
+            "txt": str(f_ds_txt),
+        }
+
+        # 9. Inode Collisions (if detected)
+        if self.inode_collision_detected:
+            f_coll_json = out_path / "inode_collisions.json"
+            with open(f_coll_json, "w", encoding="utf-8") as f:
+                json.dump(self.inode_collisions, f, indent=2)
+            f_coll_txt = out_path / "inode_collisions.txt"
+            with open(f_coll_txt, "w", encoding="utf-8") as f:
+                for c in self.inode_collisions:
+                    f.write(f"{c}\n")
+            manifest["files"]["inode_collisions"] = {
+                "count": len(self.inode_collisions),
+                "json": str(f_coll_json),
+                "txt": str(f_coll_txt),
+            }
+
+        return manifest
+
 
 # ==============================================================================
 # Terminal Presentation Engine
@@ -1694,7 +1935,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "-o",
         "--output-json",
         dest="output_json",
-        help="Optional path to write full structured diagnostic report in JSON.",
+        help="Optional path to write full structured diagnostic report in a single JSON file.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "--export-dir",
+        "--split-output-dir",
+        dest="output_dir",
+        help="Directory path to export separate, dedicated report files for each anomaly flag category (.json and .txt).",
+    )
+    parser.add_argument(
+        "--split-reports",
+        "--separate-reports",
+        dest="split_reports",
+        action="store_true",
+        help="Generate separate output files for each type of flag (uses --output-dir if set, or defaults to './audit_reports').",
     )
     parser.add_argument(
         "-v",
@@ -1762,10 +2017,38 @@ def main(argv: Optional[List[str]] = None) -> int:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(report_data, f, indent=2)
-            print(f" {Palette.c('✔ JSON Report Exported:', Palette.GREEN)} {out_path}")
+            print(f" {Palette.c('✔ Consolidated JSON Report Exported:', Palette.GREEN)} {out_path}")
             print()
         except OSError as e:
             print(f"Error writing JSON report to '{args.output_json}': {e}", file=sys.stderr)
+            return 1
+
+    # Optional separate report files per flag category
+    export_dir = None
+    if args.output_dir:
+        export_dir = args.output_dir
+    elif args.split_reports:
+        if args.output_json:
+            export_dir = str(Path(args.output_json).parent / (Path(args.output_json).stem + "_by_flag"))
+        else:
+            export_dir = "audit_reports"
+
+    if export_dir:
+        try:
+            manifest = auditor.export_separate_reports(export_dir)
+            P = Palette
+            print(f" {P.c('✔ Separate Reports Exported by Flag Category:', P.GREEN)} {manifest['output_directory']}")
+            print(f"   ├── {P.c('audit_summary.json & .txt', P.BOLD)}")
+            print(f"   ├── {P.c('orphaned_staging_files.json & .txt', P.BOLD)} ({manifest['files']['orphaned_staging_files']['count']} files)")
+            print(f"   ├── {P.c('ghost_links.json & .txt', P.BOLD)} ({manifest['files']['ghost_links']['count']} files)")
+            print(f"   ├── {P.c('over_linked_files.json & .txt', P.BOLD)} ({manifest['files']['over_linked_files']['total_paths']} paths across {manifest['files']['over_linked_files']['unique_inodes']} unique inodes)")
+            print(f"   ├── {P.c('ghost_directories.json & .txt', P.BOLD)} ({manifest['files']['ghost_directories']['count']} directories)")
+            print(f"   ├── {P.c('tv_sequence_gaps.json & .txt', P.BOLD)} ({manifest['files']['tv_sequence_gaps']['count']} seasons with gaps)")
+            print(f"   ├── {P.c('music_album_gaps.json & .txt', P.BOLD)} ({manifest['files']['music_album_gaps']['count']} albums with gaps)")
+            print(f"   └── {P.c('dataset_inconsistencies.json & .txt', P.BOLD)} ({manifest['files']['dataset_inconsistencies']['count']} inconsistencies)")
+            print()
+        except OSError as e:
+            print(f"Error exporting separate reports to '{export_dir}': {e}", file=sys.stderr)
             return 1
 
     return 0

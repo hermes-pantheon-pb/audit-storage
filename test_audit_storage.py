@@ -453,8 +453,73 @@ class TestAuditStorage(unittest.TestCase):
         self.assertIn("incomplete", data["metadata"]["exclude_downloads"])
         self.assertGreaterEqual(data["summary"]["skipped_download_dirs_count"], 3)
 
+    def test_export_separate_reports_per_flag(self):
+        """Tests that dedicated, categorized report files are generated for each anomaly flag."""
+        from audit_storage import StorageAuditor
+
+        auditor = StorageAuditor(
+            downloads_dir=str(self.downloads_dir),
+            library_dirs=[str(self.tv_dir), str(self.movies_dir), str(self.music_dir), str(self.datasets_dir)],
+        )
+        auditor.run()
+
+        export_dir = self.root / "split_reports_test"
+        manifest = auditor.export_separate_reports(str(export_dir))
+
+        expected_files = [
+            "audit_summary.json",
+            "audit_summary.txt",
+            "orphaned_staging_files.json",
+            "orphaned_staging_files.txt",
+            "ghost_links.json",
+            "ghost_links.txt",
+            "over_linked_files.json",
+            "over_linked_files.txt",
+            "ghost_directories.json",
+            "ghost_directories.txt",
+            "tv_sequence_gaps.json",
+            "tv_sequence_gaps.txt",
+            "music_album_gaps.json",
+            "music_album_gaps.txt",
+            "dataset_inconsistencies.json",
+            "dataset_inconsistencies.txt",
+        ]
+        for fname in expected_files:
+            fpath = export_dir / fname
+            self.assertTrue(fpath.exists(), f"Expected export file missing: {fname}")
+
+        # Check content of orphaned_staging_files.txt
+        orphans_txt = (export_dir / "orphaned_staging_files.txt").read_text(encoding="utf-8")
+        self.assertIn("orphan_file.mkv", orphans_txt)
+
+        # Check content of ghost_links.txt
+        ghost_txt = (export_dir / "ghost_links.txt").read_text(encoding="utf-8")
+        self.assertIn("Interstellar.2014.1080p.mkv", ghost_txt)
+
+        # Check content of tv_sequence_gaps.txt
+        tv_txt = (export_dir / "tv_sequence_gaps.txt").read_text(encoding="utf-8")
+        self.assertIn("E03", tv_txt)
+
+        # Test CLI invocation with --output-dir
+        cli_export_dir = self.root / "cli_splits"
+        cmd = [
+            sys.executable,
+            self.script_path,
+            "-d", str(self.downloads_dir),
+            "-l", str(self.tv_dir), str(self.movies_dir),
+            "--output-dir", str(cli_export_dir),
+            "--no-color",
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(res.returncode, 0, f"CLI invocation failed: {res.stderr}")
+        self.assertIn("Separate Reports Exported by Flag Category:", res.stdout)
+        self.assertTrue((cli_export_dir / "audit_summary.json").exists())
+        self.assertTrue((cli_export_dir / "orphaned_staging_files.txt").exists())
+        self.assertTrue((cli_export_dir / "over_linked_files.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

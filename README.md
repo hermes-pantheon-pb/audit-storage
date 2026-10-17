@@ -74,7 +74,8 @@ audit-storage --help
 ```text
 usage: audit-storage [-h] -d DOWNLOADS -l LIBRARIES [LIBRARIES ...]
                      [-x EXCLUDE_DOWNLOADS [EXCLUDE_DOWNLOADS ...]]
-                     [-o OUTPUT_JSON] [-v]
+                     [-o OUTPUT_JSON] [--output-dir OUTPUT_DIR]
+                     [--split-reports] [-v]
                      [--payload-threshold-mb PAYLOAD_THRESHOLD_MB]
                      [--no-color]
 ```
@@ -86,7 +87,9 @@ usage: audit-storage [-h] -d DOWNLOADS -l LIBRARIES [LIBRARIES ...]
 | `-d`, `--downloads` | `<path>` | Path to download/staging tree (e.g., torrent / usenet completed folder). |
 | `-l`, `--libraries` | `<path> ...` | One or more paths to organized media / dataset library directories. |
 | `-x`, `--exclude-downloads` | `<name/pattern> ...` | Blacklist/exclude subdirectories or globs within downloads (e.g., `incomplete`, `temp`, `torrents/temp`, `*recycle*`). Prunes matching folders from traversal. |
-| `-o`, `--output-json` | `<file.json>` | Path to write the structured JSON audit report. |
+| `-o`, `--output-json` | `<file.json>` | Path to write consolidated structured JSON audit report. |
+| `--output-dir`, `--export-dir` | `<directory>` | Path to export **separate, dedicated report files for each flag category** (both `.json` and shell-friendly `.txt` lists). |
+| `--split-reports` | `flag` | Generate separate output files for each flag category (defaults to `./audit_reports` or `<json_stem>_by_flag`). |
 | `-v`, `--verbose` | `flag` | Show detailed item-by-item breakdown instead of truncated sample listings. |
 | `--payload-threshold-mb` | `<int>` | Size threshold in MB for primary payload classification in ghost directories (default: `100`). |
 | `--no-color` | `flag` | Disable ANSI terminal color codes (also honors `NO_COLOR` environment variable). |
@@ -110,7 +113,25 @@ usage: audit-storage [-h] -d DOWNLOADS -l LIBRARIES [LIBRARIES ...]
   --exclude-downloads incomplete temp "*recycle*" "manual_singles"
 ```
 
-### 3. Comprehensive Verbose Audit with JSON Report Export
+### 3. Generating Separate Output Files for Each Anomaly Flag
+```bash
+./audit_storage.py \
+  --downloads /mnt/pool/downloads \
+  --libraries /mnt/pool/media/tv /mnt/pool/media/movies /mnt/pool/media/music \
+  --exclude-downloads incomplete temp \
+  --output-dir /mnt/pool/reports/audit_by_flag
+```
+This generates dedicated `.json` and shell-pipable `.txt` lists in `/mnt/pool/reports/audit_by_flag/`:
+- `audit_summary.json` & `audit_summary.txt`: Executive metrics, mergerfs status, and parameters.
+- `orphaned_staging_files.json` & `orphaned_staging_files.txt`: 1 filepath per line for script piping or review.
+- `ghost_links.json` & `ghost_links.txt`: Duplicate copies matching download files instead of hardlinks.
+- `over_linked_files.json` & `over_linked_files.txt`: Grouped by inode with download/library breakdown and inferred root cause.
+- `ghost_directories.json` & `ghost_directories.txt`: 1 directory per line with only residue/metadata files.
+- `tv_sequence_gaps.json` & `tv_sequence_gaps.txt`: Missing TV series episodes per season.
+- `music_album_gaps.json` & `music_album_gaps.txt`: Missing tracks per album/disc.
+- `dataset_inconsistencies.json` & `dataset_inconsistencies.txt`: Corrupted dataset pairs or missing manifests.
+
+### 4. Comprehensive Verbose Audit with JSON Report Export
 ```bash
 ./audit_storage.py \
   --downloads /mnt/pool/downloads \

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audit-storage"
+version = "1.0.0"
+description = "High-performance, read-only Linux storage pool and MergerFS hardlink invariant auditor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "hermes-pantheon-pb" }
+]
+keywords = [
+    "mergerfs",
+    "hardlinks",
+    "storage",
+    "linux",
+    "sysadmin",
+    "media-server",
+    "audit",
+    "datasets"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Topic :: System :: Filesystems",
+]
+
+[project.scripts]
+audit-storage = "audit_storage:main"
+
+[tool.setuptools]
+py-modules = ["audit_storage"]

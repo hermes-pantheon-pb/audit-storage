@@ -325,6 +325,66 @@ class TestAuditStorage(unittest.TestCase):
         ghost_names = [g.name for g in auditor.ghost_links]
         self.assertIn("Film Y (2024).mkv", ghost_names)
 
+    def test_overlink_inference_and_cross_seeding(self):
+        """Tests that cross-seeded files across download subdirectories are grouped and inferred accurately."""
+        # Create cross-seeded files across tracker_a and tracker_b
+        tracker_a = self.downloads_dir / "torrents" / "tracker_a" / "Album"
+        tracker_b = self.downloads_dir / "torrents" / "tracker_b" / "Album"
+        tracker_a.mkdir(parents=True)
+        tracker_b.mkdir(parents=True)
+
+        file_a = tracker_a / "01.flac"
+        file_b = tracker_b / "01.flac"
+        file_a.write_bytes(b"M" * 1024 * 1024 * 4)
+        os.link(file_a, file_b)  # Hardlinked in downloads (st_nlink == 2)
+
+        # Linked into library (st_nlink becomes 3)
+        music_lib = self.music_dir / "ArtistZ" / "Album"
+        music_lib.mkdir(parents=True)
+        file_lib = music_lib / "01.flac"
+        os.link(file_a, file_lib)
+
+        from audit_storage import StorageAuditor
+        auditor = StorageAuditor(
+            downloads_dir=str(self.downloads_dir),
+            library_dirs=[str(self.music_dir)],
+        )
+        auditor.run()
+
+        # Find the group for this file
+        group = next((g for g in auditor.over_linked_groups if g.sample_name == "01.flac"), None)
+        self.assertIsNotNone(group)
+        self.assertEqual(group.st_nlink, 3)
+        self.assertEqual(group.downloads_count, 2)
+        self.assertEqual(group.libraries_count, 1)
+        self.assertEqual(group.external_count, 0)
+        self.assertEqual(group.inferred_cause, "cross_seeding")
+
+        # Verify inference report contains the cross-seed folders
+        inf = auditor.overlink_inference
+        self.assertIsNotNone(inf)
+        self.assertTrue(inf.physical_sanity_verified)
+        self.assertFalse(inf.inode_collision_detected)
+        self.assertIn("cross_seeding", inf.cause_breakdown)
+
+    def test_inode_collision_detection(self):
+        """Tests that files with different sizes sharing the same (dev, ino) trigger the collision alert."""
+        from audit_storage import FileRecord, StorageAuditor
+        auditor = StorageAuditor(
+            downloads_dir=str(self.downloads_dir),
+            library_dirs=[str(self.music_dir)],
+        )
+        # Mock an inode collision: same (dev, ino) but different sizes
+        auditor.inode_map[(100, 500)]["downloads"].append(
+            FileRecord(path="/dl/file1.mkv", name="file1.mkv", dev=100, ino=500, nlink=2, size=1000, is_download=True)
+        )
+        auditor.inode_map[(100, 500)]["libraries"].append(
+            FileRecord(path="/lib/file2.mkv", name="file2.mkv", dev=100, ino=500, nlink=2, size=2000, is_download=False)
+        )
+        auditor._analyze_hardlink_invariants()
+        self.assertTrue(auditor.inode_collision_detected)
+        self.assertGreaterEqual(len(auditor.inode_collisions), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

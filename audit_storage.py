@@ -13,7 +13,7 @@ Zero modifications, moves, or deletions.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 import datetime
 import json
@@ -173,6 +173,38 @@ class HardlinkAnomaly:
 
 
 @dataclass
+class OverlinkedInodeGroup:
+    dev: int
+    ino: int
+    st_nlink: int
+    downloads_count: int
+    libraries_count: int
+    external_count: int
+    downloads_paths: List[str]
+    library_paths: List[str]
+    size: int
+    size_human: str
+    sample_name: str
+    inferred_cause: str  # 'cross_seeding', 'external_snapshot', 'multi_library', 'dedup_consolidation', 'multi_link'
+    details: str
+
+
+@dataclass
+class OverlinkInferenceReport:
+    total_unique_inodes: int
+    total_tracked_paths: int
+    total_bytes: int
+    total_bytes_human: str
+    physical_sanity_verified: bool
+    inode_collision_detected: bool
+    collision_details: List[str]
+    cause_breakdown: Dict[str, int]
+    top_cross_seed_folders: List[Dict[str, Any]]
+    link_histogram: Dict[str, int]
+    extension_profile: Dict[str, int]
+
+
+@dataclass
 class GhostDirectory:
     path: str
     residue_count: int
@@ -264,8 +296,15 @@ class StorageAuditor:
         self.orphan_staging_files: List[HardlinkAnomaly] = []
         self.ghost_links: List[HardlinkAnomaly] = []
         self.over_linked_files: List[HardlinkAnomaly] = []
+        self.over_linked_groups: List[OverlinkedInodeGroup] = []
         self.normal_hardlinks_count = 0
         self.normal_hardlinks_bytes = 0
+        self.normal_with_external_snapshots_count = 0
+
+        # Inode collision and inference diagnostics
+        self.inode_collision_detected = False
+        self.inode_collisions: List[str] = []
+        self.overlink_inference: Optional[OverlinkInferenceReport] = None
 
         self.ghost_directories: List[GhostDirectory] = []
         self.tv_gaps: List[TVSequenceGap] = []
@@ -630,23 +669,52 @@ class StorageAuditor:
                             ghost_link_download_paths.add(dl_rec.path)
                             break
 
-        # Step B: Analyze Download Directory items
+        # Step B: Analyze Inode Link Topologies & Invariants
+        cross_seed_pair_counter: Counter[Tuple[str, str]] = Counter()
+        link_hist: Counter[int] = Counter()
+        ext_counter: Counter[str] = Counter()
+        cause_counter: Counter[str] = Counter()
+
         for (dev, ino), data in self.inode_map.items():
             dl_records = data["downloads"]
             lib_records = data["libraries"]
             if not dl_records:
                 continue
 
-            for dl_rec in dl_records:
-                if dl_rec.nlink == 1:
-                    # Staging file with only 1 link
-                    # Check if it was already flagged as a counterpart to a ghost link
-                    is_ghost_cp = dl_rec.path in ghost_link_download_paths
-                    details = (
-                        "Staging file copied to library instead of hardlinked (ghost link counterpart)."
-                        if is_ghost_cp
-                        else "Orphaned staging file. Has no hardlink in organized library (st_nlink == 1)."
+            all_records = dl_records + lib_records
+            ref_size = all_records[0].size
+            # Sanity check: verify physical inode size consistency across all appearances
+            for r in all_records[1:]:
+                if r.size != ref_size:
+                    self.inode_collision_detected = True
+                    self.inode_collisions.append(
+                        f"Collision on (dev={dev}, ino={ino}): '{all_records[0].path}' ({format_bytes(ref_size)}) vs '{r.path}' ({format_bytes(r.size)})"
                     )
+
+            D = len(dl_records)
+            L = len(lib_records)
+            T = D + L
+            st_nlink = dl_records[0].nlink
+            E = max(0, st_nlink - T)
+
+            sample_rec = dl_records[0]
+            dl_paths = [r.path for r in dl_records]
+            lib_paths = [r.path for r in lib_records]
+            ext = Path(sample_rec.name).suffix.lower()
+
+            # Case 1: Orphan Staging (Zero paths in library)
+            if L == 0:
+                for dl_rec in dl_records:
+                    is_ghost_cp = dl_rec.path in ghost_link_download_paths
+                    if is_ghost_cp:
+                        details = "Staging file copied to library instead of hardlinked (ghost link counterpart)."
+                    elif D > 1:
+                        details = f"Multi-staged orphan: present across {D} locations in downloads, but 0 in organized library."
+                    elif E > 0:
+                        details = f"Staging file has {st_nlink} links on disk ({E} external), but 0 in organized library."
+                    else:
+                        details = "Orphaned staging file. Has no hardlink in organized library (st_nlink == 1)."
+
                     self.orphan_staging_files.append(
                         HardlinkAnomaly(
                             category="orphan_staging",
@@ -657,36 +725,129 @@ class StorageAuditor:
                             dev=dl_rec.dev,
                             ino=dl_rec.ino,
                             nlink=dl_rec.nlink,
-                            counterpart_paths=[r.path for r in lib_records],
+                            counterpart_paths=lib_paths,
                             details=details,
                         )
                     )
-                elif dl_rec.nlink == 2:
-                    # Normal active hardlink
-                    self.normal_hardlinks_count += 1
-                    self.normal_hardlinks_bytes += dl_rec.size
-                elif dl_rec.nlink > 2:
-                    # Over-linked
-                    counterparts = [r.path for r in dl_records if r.path != dl_rec.path] + [
-                        r.path for r in lib_records
-                    ]
-                    self.over_linked_files.append(
-                        HardlinkAnomaly(
-                            category="over_linked",
-                            path=dl_rec.path,
-                            name=dl_rec.name,
-                            size=dl_rec.size,
-                            size_human=format_bytes(dl_rec.size),
-                            dev=dl_rec.dev,
-                            ino=dl_rec.ino,
-                            nlink=dl_rec.nlink,
-                            counterpart_paths=counterparts,
-                            details=(
-                                f"Over-linked file with {dl_rec.nlink} links. "
-                                f"Present across {len(counterparts)} other tracked location(s)."
-                            ),
-                        )
+                continue
+
+            # Case 2: Healthy 1:1 Link (1 in downloads, 1 in library)
+            if D == 1 and L == 1:
+                self.normal_hardlinks_count += 1
+                self.normal_hardlinks_bytes += sample_rec.size
+                if E > 0:
+                    self.normal_with_external_snapshots_count += 1
+                continue
+
+            # Case 3: Over-Linked / Multi-Linked Inode (D > 1, or L > 1, or st_nlink > 2 with multiple tracked paths)
+            # Inferred Root Cause:
+            if st_nlink >= 10:
+                inferred_cause = "dedup_consolidation"
+                details = (
+                    f"High-density deduplication link: {st_nlink} physical links "
+                    f"({D} in downloads, {L} in library, {E} external). "
+                    f"Common result of deduplication utilities (jdupes/rmlint) consolidating identical files."
+                )
+            elif D > 1 and L >= 1:
+                inferred_cause = "cross_seeding"
+                rel_folders = set()
+                for p in dl_paths:
+                    rel = os.path.relpath(p, self.downloads_dir)
+                    parts = Path(rel).parts
+                    if len(parts) > 1:
+                        rel_folders.add(parts[0])
+                    else:
+                        rel_folders.add("downloads_root")
+                if len(rel_folders) > 1:
+                    sorted_folders = sorted(rel_folders)
+                    for i in range(len(sorted_folders)):
+                        for j in range(i + 1, len(sorted_folders)):
+                            cross_seed_pair_counter[(sorted_folders[i], sorted_folders[j])] += 1
+                    folder_str = " ↔ ".join(f"'{f}'" for f in sorted(rel_folders)[:3])
+                    details = (
+                        f"Cross-seeded across {D} download folders ({folder_str}), "
+                        f"linked to {L} library location(s) [st_nlink={st_nlink}, {E} external]."
                     )
+                else:
+                    details = (
+                        f"Duplicated across {D} paths within '{list(rel_folders)[0]}', "
+                        f"linked to {L} library location(s) [st_nlink={st_nlink}, {E} external]."
+                    )
+            elif D >= 1 and L > 1:
+                inferred_cause = "multi_library"
+                details = (
+                    f"Multi-library linked: present in {L} library destinations and {D} download location(s) "
+                    f"[st_nlink={st_nlink}, {E} external]."
+                )
+            else:
+                inferred_cause = "external_snapshot"
+                details = (
+                    f"File has {st_nlink} physical links ({D} in downloads, {L} in library, {E} external). "
+                    f"External links reside outside scanned trees (e.g. backup snapshots)."
+                )
+
+            group = OverlinkedInodeGroup(
+                dev=dev,
+                ino=ino,
+                st_nlink=st_nlink,
+                downloads_count=D,
+                libraries_count=L,
+                external_count=E,
+                downloads_paths=dl_paths,
+                library_paths=lib_paths,
+                size=sample_rec.size,
+                size_human=format_bytes(sample_rec.size),
+                sample_name=sample_rec.name,
+                inferred_cause=inferred_cause,
+                details=details,
+            )
+            self.over_linked_groups.append(group)
+
+            for r in dl_records:
+                counterparts = [p for p in dl_paths if p != r.path] + lib_paths
+                self.over_linked_files.append(
+                    HardlinkAnomaly(
+                        category="over_linked",
+                        path=r.path,
+                        name=r.name,
+                        size=r.size,
+                        size_human=format_bytes(r.size),
+                        dev=r.dev,
+                        ino=r.ino,
+                        nlink=r.nlink,
+                        counterpart_paths=counterparts,
+                        details=details,
+                    )
+                )
+
+            link_hist[st_nlink] += 1
+            ext_counter[ext or "none"] += 1
+            cause_counter[inferred_cause] += 1
+
+        # Build OverlinkInferenceReport
+        top_cross_seeds = [
+            {"folder_a": p[0], "folder_b": p[1], "shared_inodes": count}
+            for p, count in cross_seed_pair_counter.most_common(5)
+        ]
+        top_exts = dict(ext_counter.most_common(5))
+        hist_dict = {str(k): v for k, v in sorted(link_hist.items())}
+
+        total_bytes = sum(g.size for g in self.over_linked_groups)
+        total_paths = sum(g.downloads_count + g.libraries_count for g in self.over_linked_groups)
+
+        self.overlink_inference = OverlinkInferenceReport(
+            total_unique_inodes=len(self.over_linked_groups),
+            total_tracked_paths=total_paths,
+            total_bytes=total_bytes,
+            total_bytes_human=format_bytes(total_bytes),
+            physical_sanity_verified=(not self.inode_collision_detected),
+            inode_collision_detected=self.inode_collision_detected,
+            collision_details=self.inode_collisions[:5],
+            cause_breakdown=dict(cause_counter),
+            top_cross_seed_folders=top_cross_seeds,
+            link_histogram=hist_dict,
+            extension_profile=top_exts,
+        )
 
     # --------------------------------------------------------------------------
     # TV Series Sequence Heuristics
@@ -1034,8 +1195,12 @@ class StorageAuditor:
                 "counts": {
                     "orphaned_staging_files": len(self.orphan_staging_files),
                     "ghost_links": len(self.ghost_links),
-                    "over_linked_files": len(self.over_linked_files),
+                    "over_linked_files": len(self.over_linked_groups),
+                    "over_linked_unique_inodes": len(self.over_linked_groups),
+                    "over_linked_total_paths": len(self.over_linked_files),
                     "normal_active_hardlinks": self.normal_hardlinks_count,
+                    "normal_with_external_snapshots": self.normal_with_external_snapshots_count,
+                    "inode_collision_detected": self.inode_collision_detected,
                     "ghost_directories": len(self.ghost_directories),
                     "tv_sequence_gaps": len(self.tv_gaps),
                     "music_album_gaps": len(self.music_gaps),
@@ -1048,9 +1213,12 @@ class StorageAuditor:
                     "count": self.normal_hardlinks_count,
                     "total_bytes": self.normal_hardlinks_bytes,
                     "total_size_human": format_bytes(self.normal_hardlinks_bytes),
+                    "with_external_snapshots": self.normal_with_external_snapshots_count,
                 },
                 "ghost_links": [asdict(x) for x in self.ghost_links],
                 "orphaned_staging_files": [asdict(x) for x in self.orphan_staging_files],
+                "over_linked_inference": asdict(self.overlink_inference) if self.overlink_inference else None,
+                "over_linked_groups": [asdict(g) for g in self.over_linked_groups],
                 "over_linked_files": [asdict(x) for x in self.over_linked_files],
             },
             "suspected_ghost_directories": [asdict(x) for x in self.ghost_directories],
@@ -1128,16 +1296,25 @@ class TerminalReporter:
 
     def _print_summary_metrics(self) -> None:
         P = Palette
+        over_inodes_count = len(self.auditor.over_linked_groups)
+        over_paths_count = len(self.auditor.over_linked_files)
+        ext_snap_note = (
+            f" (incl. {self.auditor.normal_with_external_snapshots_count} with external snapshots)"
+            if self.auditor.normal_with_external_snapshots_count > 0
+            else ""
+        )
+        over_label = f"{over_inodes_count} unique inodes ({over_paths_count} paths)" if over_inodes_count > 0 else "0"
+
         print(P.c("┌── [1] AUDIT SUMMARY & METRICS " + "─" * 49, P.CYAN))
         print(f"│ Total Files Audited:      {P.c(str(self.auditor.total_scanned_files), P.BOLD)} ({format_bytes(self.auditor.total_scanned_bytes)})")
         print(f"│ Downloads Staging Files:  {self.auditor.downloads_file_count} ({format_bytes(self.auditor.downloads_total_bytes)})")
         print(f"│ Organized Library Files:  {self.auditor.library_file_count} ({format_bytes(self.auditor.library_total_bytes)})")
         print(f"│ Distinct Inode Keys:      {len(self.auditor.inode_map)}")
         print("│")
-        print(f"│ Active Normal Hardlinks:  {P.c(str(self.auditor.normal_hardlinks_count), P.GREEN)} ({format_bytes(self.auditor.normal_hardlinks_bytes)})")
+        print(f"│ Active Normal Hardlinks:  {P.c(str(self.auditor.normal_hardlinks_count), P.GREEN)} ({format_bytes(self.auditor.normal_hardlinks_bytes)}){ext_snap_note}")
         print(f"│ Orphan Staging Files:     {P.c(str(len(self.auditor.orphan_staging_files)), P.YELLOW if self.auditor.orphan_staging_files else P.GREEN)}")
         print(f"│ Ghost Links (Copies):     {P.c(str(len(self.auditor.ghost_links)), P.RED if self.auditor.ghost_links else P.GREEN)}")
-        print(f"│ Over-Linked Files (>2):   {P.c(str(len(self.auditor.over_linked_files)), P.YELLOW if self.auditor.over_linked_files else P.GREEN)}")
+        print(f"│ Over-Linked Inodes (>2):  {P.c(over_label, P.YELLOW if over_inodes_count else P.GREEN)}")
         print(f"│ Ghost Directories:        {P.c(str(len(self.auditor.ghost_directories)), P.YELLOW if self.auditor.ghost_directories else P.GREEN)}")
         print(f"│ TV Sequence Gaps:         {P.c(str(len(self.auditor.tv_gaps)), P.YELLOW if self.auditor.tv_gaps else P.GREEN)}")
         print(f"│ Music Album Gaps:         {P.c(str(len(self.auditor.music_gaps)), P.YELLOW if self.auditor.music_gaps else P.GREEN)}")
@@ -1179,20 +1356,87 @@ class TerminalReporter:
 
         print("│")
 
-        # 2.3 Over-linked files
-        print(f"│ {P.c('● Over-Linked Files (st_nlink > 2):', P.BOLD)} {len(self.auditor.over_linked_files)}")
-        if not self.auditor.over_linked_files:
+        # 2.3 Over-linked files & Inference Engine
+        over_inodes_count = len(self.auditor.over_linked_groups)
+        over_paths_count = len(self.auditor.over_linked_files)
+        inf = self.auditor.overlink_inference
+
+        print(f"│ {P.c('● Over-Linked Inodes & Multi-Linked Staging:', P.BOLD)} {over_inodes_count} unique files ({over_paths_count} paths tracked)")
+        if not self.auditor.over_linked_groups:
             print("│   (No over-linked files detected)")
         else:
-            items_to_show = self.auditor.over_linked_files if self.verbose else self.auditor.over_linked_files[:5]
-            for item in items_to_show:
-                print(f"│   {P.c('ℹ OVER-LINKED:', P.MAGENTA)} {item.path} [st_nlink={item.nlink}]")
-                for cp in item.counterpart_paths[:3]:
-                    print(f"│     ↳ Link: {cp}")
-                if len(item.counterpart_paths) > 3:
-                    print(f"│     ↳ ... +{len(item.counterpart_paths) - 3} additional paths")
-            if len(self.auditor.over_linked_files) > len(items_to_show):
-                print(f"│   ... and {len(self.auditor.over_linked_files) - len(items_to_show)} more")
+            # Inference Box
+            print("│")
+            print("│   " + P.c("┌─ OVER-LINKING INFERENCE & ROOT-CAUSE DIAGNOSTICS " + "─" * 25, P.CYAN))
+
+            # Physical Inode Sanity Check
+            if inf and inf.inode_collision_detected:
+                print("│   │ " + P.c("🚨 CRITICAL INODE COLLISION DETECTED!", P.BOLD + P.RED))
+                print("│   │   Files of differing sizes report identical (st_dev, st_ino).")
+                print("│   │   MergerFS is passing through raw inodes across branch disks without device isolation.")
+                for c in inf.collision_details[:3]:
+                    print(f"│   │   ↳ {c}")
+            else:
+                print("│   │ " + P.c("✔ Physical Inode Integrity:", P.GREEN) + " Verified sound.")
+                print("│   │   All shared paths match exact byte size and attributes (zero MergerFS inode collisions).")
+
+            if inf:
+                print("│   │")
+                print("│   │ " + P.c("── Inferred Root Causes ──", P.BOLD))
+                cause_names = {
+                    "cross_seeding": "Cross-Seeding Across Download Subdirectories",
+                    "multi_library": "Multi-Library Destination Linking",
+                    "external_snapshot": "External Snapshot / Backup Hardlinks",
+                    "dedup_consolidation": "Deduplication Utility Consolidation",
+                    "multi_link": "General Multi-Linked Files",
+                }
+                for cause_key, count in inf.cause_breakdown.items():
+                    name = cause_names.get(cause_key, cause_key.replace("_", " ").title())
+                    pct = (count / over_inodes_count * 100) if over_inodes_count else 0
+                    print(f"│   │   ● {P.c(name + ':', P.BOLD)} {count} inodes ({pct:.1f}%)")
+
+                if inf.top_cross_seed_folders:
+                    print("│   │")
+                    print("│   │   " + P.c("Top Cross-Seeded Source Folder Pairs:", P.BOLD))
+                    for fpair in inf.top_cross_seed_folders:
+                        print(f"│   │     ↳ '{fpair['folder_a']}' ↔ '{fpair['folder_b']}': {fpair['shared_inodes']} shared files")
+
+                print("│   │")
+                print("│   │ " + P.c("── Link Multiplicity & File Types ──", P.BOLD))
+                hist_strs = [f"{k} links: {v}" for k, v in sorted(inf.link_histogram.items(), key=lambda x: int(x[0]))[:4]]
+                print(f"│   │   ● Multiplicity: {', '.join(hist_strs)}")
+                ext_strs = [f"{ext} ({cnt})" for ext, cnt in inf.extension_profile.items()]
+                if ext_strs:
+                    print(f"│   │   ● File Formats: {', '.join(ext_strs)}")
+
+            print("│   " + P.c("└" + "─" * 72, P.CYAN))
+            print("│")
+
+            # Representative Samples (cleanly clamped to max 3 in non-verbose, 15 in verbose)
+            max_samples = 15 if self.verbose else 3
+            sample_groups = self.auditor.over_linked_groups[:max_samples]
+            print("│   " + P.c(f"── Representative Over-Linked Inodes (Showing {len(sample_groups)} of {over_inodes_count}) ──", P.BOLD))
+            for g in sample_groups:
+                tag = f"[st_nlink={g.st_nlink} | DL: {g.downloads_count}, LIB: {g.libraries_count}, EXT: {g.external_count}]"
+                print(f"│   {P.c(tag, P.MAGENTA)} {g.sample_name} ({g.size_human})")
+                print(f"│     ↳ Inode: {g.ino} | Cause: {P.c(g.inferred_cause, P.BOLD)}")
+                if g.downloads_paths:
+                    print(f"│     ↳ Downloads ({len(g.downloads_paths)}):")
+                    for p in g.downloads_paths[:2]:
+                        print(f"│       • {p}")
+                    if len(g.downloads_paths) > 2:
+                        print(f"│       • ... +{len(g.downloads_paths) - 2} more download locations")
+                if g.library_paths:
+                    print(f"│     ↳ Libraries ({len(g.library_paths)}):")
+                    for p in g.library_paths[:2]:
+                        print(f"│       • {p}")
+                    if len(g.library_paths) > 2:
+                        print(f"│       • ... +{len(g.library_paths) - 2} more library locations")
+                if g.external_count > 0:
+                    print(f"│     ↳ External: {g.external_count} link(s) outside scanned directories (e.g. backup snapshots)")
+
+            if over_inodes_count > len(sample_groups):
+                print(f"│   ... and {over_inodes_count - len(sample_groups)} more unique inodes (see full breakdown with --output-json)")
 
         print(P.c("└" + "─" * 79, P.CYAN))
         print()

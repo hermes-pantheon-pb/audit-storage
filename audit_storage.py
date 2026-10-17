@@ -256,8 +256,9 @@ class StorageAuditor:
             lambda: {"downloads": [], "libraries": []}
         )
 
-        # Index download files by (name, size) for Ghost Link (copy vs hardlink) detection
+        # Index download files by (name, size) and size for Ghost Link (copy vs hardlink) detection
         self.downloads_by_name_size: Dict[Tuple[str, int], List[FileRecord]] = defaultdict(list)
+        self.downloads_by_size: Dict[int, List[FileRecord]] = defaultdict(list)
 
         # Collections of flagged findings
         self.orphan_staging_files: List[HardlinkAnomaly] = []
@@ -369,6 +370,7 @@ class StorageAuditor:
                 key = (rec.dev, rec.ino)
                 self.inode_map[key]["downloads"].append(rec)
                 self.downloads_by_name_size[(rec.name, rec.size)].append(rec)
+                self.downloads_by_size[rec.size].append(rec)
 
     def _scan_libraries(self) -> None:
         """
@@ -578,7 +580,7 @@ class StorageAuditor:
         # Set to track files already classified as ghost links
         ghost_link_download_paths: Set[str] = set()
 
-        # Step A: Identify Ghost Links (Library file st_nlink == 1, matching download name & size)
+        # Step A: Identify Ghost Links (Library file st_nlink == 1, matching download name & size or byte size for payloads)
         for (dev, ino), data in self.inode_map.items():
             lib_records = data["libraries"]
             if not lib_records:
@@ -586,14 +588,28 @@ class StorageAuditor:
 
             for lib_rec in lib_records:
                 if lib_rec.nlink == 1:
-                    # Look up if an identical file exists in downloads
+                    # 1. Look up if an identical filename + size file exists in downloads
                     candidates = self.downloads_by_name_size.get((lib_rec.name, lib_rec.size), [])
+                    renamed = False
+
+                    # 2. Fallback: Exact byte size match for large payloads (>= 10MB) even if renamed on import
+                    if not candidates and lib_rec.size >= 10 * 1024 * 1024:
+                        size_candidates = self.downloads_by_size.get(lib_rec.size, [])
+                        candidates = [
+                            c for c in size_candidates
+                            if Path(c.name).suffix.lower() == Path(lib_rec.name).suffix.lower()
+                            or Path(c.name).suffix.lower() in PAYLOAD_EXTENSIONS
+                        ]
+                        if candidates:
+                            renamed = True
+
                     for dl_rec in candidates:
                         # If different inode or device, they are NOT hardlinked: it is a duplicate copy!
                         if (dl_rec.dev != lib_rec.dev) or (dl_rec.ino != lib_rec.ino):
                             cross_dev_note = (
                                 " [Cross-Device EXDEV]" if dl_rec.dev != lib_rec.dev else " [Same Device Copy]"
                             )
+                            rename_note = f" under different name '{dl_rec.name}'" if renamed else ""
                             self.ghost_links.append(
                                 HardlinkAnomaly(
                                     category="ghost_link",
@@ -606,7 +622,7 @@ class StorageAuditor:
                                     nlink=lib_rec.nlink,
                                     counterpart_paths=[dl_rec.path],
                                     details=(
-                                        f"File in library has st_nlink=1 matching staging file of identical name/size.{cross_dev_note} "
+                                        f"File in library has st_nlink=1 matching staging file of identical size{rename_note}.{cross_dev_note} "
                                         f"A duplicate copy occurred rather than a hardlink (common MergerFS cross-branch failure)."
                                     ),
                                 )

@@ -283,6 +283,48 @@ class TestAuditStorage(unittest.TestCase):
         result = subprocess.run(cmd, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
 
+    def test_nested_subdirectories_in_downloads(self):
+        """Tests that nested subdirectories in downloads are fully traversed and hardlinks/ghost links resolved."""
+        # 1. Nested download folder: downloads/torrents/seeding/ShowX
+        nested_dl_folder = self.downloads_dir / "torrents" / "seeding" / "ShowX.S03.1080p"
+        nested_dl_folder.mkdir(parents=True)
+        nested_file = nested_dl_folder / "showx.s03e01.mkv"
+        nested_file.write_bytes(b"N" * 1024 * 1024 * 3)
+
+        # Hardlinked into library
+        lib_show = self.tv_dir / "Show X" / "Season 03"
+        lib_show.mkdir(parents=True)
+        lib_ep = lib_show / "Show X - S03E01.mkv"
+        os.link(nested_file, lib_ep)
+
+        # 2. Nested download folder with renamed copy (Ghost Link):
+        # Staging: downloads/usenet/completed/FilmY/sparks-filmy.mkv (11MB)
+        # Library: movies/Film Y/Film Y (2024).mkv (11MB, separate inode)
+        usenet_folder = self.downloads_dir / "usenet" / "completed" / "FilmY"
+        usenet_folder.mkdir(parents=True)
+        usenet_file = usenet_folder / "sparks-filmy.mkv"
+        usenet_file.write_bytes(b"Y" * 1024 * 1024 * 11)
+
+        lib_filmy_folder = self.movies_dir / "Film Y (2024)"
+        lib_filmy_folder.mkdir(parents=True)
+        lib_filmy_file = lib_filmy_folder / "Film Y (2024).mkv"
+        lib_filmy_file.write_bytes(b"Y" * 1024 * 1024 * 11)
+
+        from audit_storage import StorageAuditor
+        auditor = StorageAuditor(
+            downloads_dir=str(self.downloads_dir),
+            library_dirs=[str(self.tv_dir), str(self.movies_dir)],
+        )
+        auditor.run()
+
+        # Verify the nested hardlink was counted
+        active_paths = [rec.path for pairs in auditor.inode_map.values() for rec in pairs["downloads"] if rec.nlink == 2]
+        self.assertIn(str(nested_file), active_paths)
+
+        # Verify the renamed copy in nested folder was detected as a Ghost Link
+        ghost_names = [g.name for g in auditor.ghost_links]
+        self.assertIn("Film Y (2024).mkv", ghost_names)
+
 
 if __name__ == "__main__":
     unittest.main()

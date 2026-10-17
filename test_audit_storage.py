@@ -385,7 +385,76 @@ class TestAuditStorage(unittest.TestCase):
         self.assertTrue(auditor.inode_collision_detected)
         self.assertGreaterEqual(len(auditor.inode_collisions), 1)
 
+    def test_exclude_downloads_subdirectories(self):
+        """Tests that blacklisted subdirectories in downloads are pruned during scan."""
+        from audit_storage import StorageAuditor
+
+        # Create subdirectories with single-link files that would otherwise be flagged as orphans
+        incomplete_dir = self.downloads_dir / "incomplete"
+        incomplete_dir.mkdir(parents=True, exist_ok=True)
+        (incomplete_dir / "partial_download.iso").write_bytes(b"I" * 1024 * 1024)
+
+        nested_temp = self.downloads_dir / "torrents" / "temp"
+        nested_temp.mkdir(parents=True, exist_ok=True)
+        (nested_temp / "unpacking.rar").write_bytes(b"U" * 1024 * 1024)
+
+        recycle_dir = self.downloads_dir / ".recycle"
+        recycle_dir.mkdir(parents=True, exist_ok=True)
+        (recycle_dir / "deleted_item.mkv").write_bytes(b"R" * 1024 * 1024)
+
+        # Baseline: without exclusion, these 3 files are flagged as orphan staging files
+        auditor_all = StorageAuditor(
+            downloads_dir=str(self.downloads_dir),
+            library_dirs=[str(self.tv_dir)],
+        )
+        auditor_all.run()
+        all_orphans = [Path(x.path).name for x in auditor_all.orphan_staging_files]
+        self.assertIn("partial_download.iso", all_orphans)
+        self.assertIn("unpacking.rar", all_orphans)
+        self.assertIn("deleted_item.mkv", all_orphans)
+
+        # Audit with exclusion patterns: basename, relative path, glob
+        auditor_excluded = StorageAuditor(
+            downloads_dir=str(self.downloads_dir),
+            library_dirs=[str(self.tv_dir)],
+            exclude_downloads=["incomplete", "torrents/temp", ".*recycle*"],
+        )
+        auditor_excluded.run()
+        excluded_orphans = [Path(x.path).name for x in auditor_excluded.orphan_staging_files]
+        self.assertNotIn("partial_download.iso", excluded_orphans)
+        self.assertNotIn("unpacking.rar", excluded_orphans)
+        self.assertNotIn("deleted_item.mkv", excluded_orphans)
+
+        # Verify skipped_download_dirs contains the pruned subdirectories
+        skipped_names = [Path(d).name for d in auditor_excluded.skipped_download_dirs]
+        self.assertIn("incomplete", skipped_names)
+        self.assertIn("temp", skipped_names)
+        self.assertIn(".recycle", skipped_names)
+
+        # Test CLI invocation with -x flag and JSON output
+        json_out = self.root / "exclude_report.json"
+        cmd = [
+            sys.executable,
+            self.script_path,
+            "-d", str(self.downloads_dir),
+            "-l", str(self.tv_dir),
+            "-x", "incomplete", "torrents/temp",
+            "-x", ".*recycle*",
+            "-o", str(json_out),
+            "--no-color",
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
+        self.assertIn("Excluded Subdirs:", res.stdout)
+        self.assertIn("Excluded Download Dirs:", res.stdout)
+
+        with open(json_out, "r") as f:
+            data = json.load(f)
+        self.assertIn("incomplete", data["metadata"]["exclude_downloads"])
+        self.assertGreaterEqual(data["summary"]["skipped_download_dirs_count"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

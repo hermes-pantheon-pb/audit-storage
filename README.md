@@ -73,6 +73,7 @@ audit-storage --help
 
 ```text
 usage: audit-storage [-h] -d DOWNLOADS -l LIBRARIES [LIBRARIES ...]
+                     [-x EXCLUDE_DOWNLOADS [EXCLUDE_DOWNLOADS ...]]
                      [-o OUTPUT_JSON] [-v]
                      [--payload-threshold-mb PAYLOAD_THRESHOLD_MB]
                      [--no-color]
@@ -84,6 +85,7 @@ usage: audit-storage [-h] -d DOWNLOADS -l LIBRARIES [LIBRARIES ...]
 | :--- | :--- | :--- |
 | `-d`, `--downloads` | `<path>` | Path to download/staging tree (e.g., torrent / usenet completed folder). |
 | `-l`, `--libraries` | `<path> ...` | One or more paths to organized media / dataset library directories. |
+| `-x`, `--exclude-downloads` | `<name/pattern> ...` | Blacklist/exclude subdirectories or globs within downloads (e.g., `incomplete`, `temp`, `torrents/temp`, `*recycle*`). Prunes matching folders from traversal. |
 | `-o`, `--output-json` | `<file.json>` | Path to write the structured JSON audit report. |
 | `-v`, `--verbose` | `flag` | Show detailed item-by-item breakdown instead of truncated sample listings. |
 | `--payload-threshold-mb` | `<int>` | Size threshold in MB for primary payload classification in ghost directories (default: `100`). |
@@ -100,11 +102,20 @@ usage: audit-storage [-h] -d DOWNLOADS -l LIBRARIES [LIBRARIES ...]
   --libraries /mnt/pool/media/tv /mnt/pool/media/movies /mnt/pool/media/music
 ```
 
-### 2. Comprehensive Verbose Audit with JSON Report Export
+### 2. Excluding Staging Subdirectories (Incomplete / Temp / Singles)
+```bash
+./audit_storage.py \
+  --downloads /mnt/pool/downloads \
+  --libraries /mnt/pool/media/tv /mnt/pool/media/movies \
+  --exclude-downloads incomplete temp "*recycle*" "manual_singles"
+```
+
+### 3. Comprehensive Verbose Audit with JSON Report Export
 ```bash
 ./audit_storage.py \
   --downloads /mnt/pool/downloads \
   --libraries /mnt/pool/media/tv /mnt/pool/media/movies /mnt/pool/datasets \
+  --exclude-downloads incomplete torrents/temp \
   --verbose \
   --output-json /mnt/pool/reports/storage_audit_$(date +%F).json
 ```

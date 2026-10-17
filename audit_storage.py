@@ -16,12 +16,13 @@ import argparse
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 import datetime
+import fnmatch
 import json
 import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 
 # ==============================================================================
@@ -267,11 +268,14 @@ class StorageAuditor:
         self,
         downloads_dir: str,
         library_dirs: List[str],
+        exclude_downloads: Optional[List[str]] = None,
         payload_threshold_bytes: int = 100 * 1024 * 1024,
         verbose: bool = False,
     ):
         self.downloads_dir = str(Path(downloads_dir).resolve())
         self.library_dirs = [str(Path(p).resolve()) for p in library_dirs]
+        self.exclude_downloads: List[str] = list(exclude_downloads or [])
+        self.skipped_download_dirs: List[str] = []
         self.payload_threshold = payload_threshold_bytes
         self.verbose = verbose
 
@@ -331,11 +335,76 @@ class StorageAuditor:
     # Directory Traversal
     # --------------------------------------------------------------------------
 
-    def _walk_tree_postorder(self, root_path: str) -> Iterator[Tuple[str, List[os.DirEntry], List[str]]]:
+    def _is_download_dir_excluded(self, dirpath: str) -> bool:
+        """
+        Determines whether a download subdirectory matches any exclusion rule or pattern.
+        Supports:
+          - Directory name (basename): e.g. 'incomplete', 'temp', '.recycle'
+          - Relative path from downloads: e.g. 'torrents/incomplete', 'usenet/intermediate'
+          - Glob patterns: e.g. '*temp*', '*.tmp', 'manual*'
+          - Absolute or normalized paths
+        """
+        if not self.exclude_downloads:
+            return False
+
+        norm_path = os.path.normpath(dirpath)
+        if norm_path == self.downloads_dir:
+            return False
+
+        base_name = os.path.basename(norm_path)
+        try:
+            rel_path = os.path.relpath(norm_path, self.downloads_dir)
+        except ValueError:
+            rel_path = norm_path
+
+        rel_parts = Path(rel_path).parts if rel_path != "." else ()
+
+        for raw_pat in self.exclude_downloads:
+            pat = raw_pat.strip()
+            if not pat:
+                continue
+            clean_pat = os.path.normpath(pat).rstrip("/\\")
+
+            # 1. Exact match against directory base name
+            if base_name == clean_pat or base_name == pat.rstrip("/\\"):
+                return True
+
+            # 2. Exact match against relative path or full path
+            if rel_path == clean_pat or norm_path == clean_pat:
+                return True
+
+            # 3. Path component match (e.g. if pattern is 'incomplete' and path is 'torrents/incomplete')
+            if clean_pat in rel_parts:
+                return True
+
+            # 4. Glob pattern match against directory base name (e.g. '*temp*', 'incomplete*')
+            if fnmatch.fnmatch(base_name, clean_pat):
+                return True
+
+            # 5. Glob pattern match against relative path (e.g. 'torrents/*', '*/incomplete')
+            if fnmatch.fnmatch(rel_path, clean_pat):
+                return True
+
+            # 6. Absolute path resolution
+            try:
+                if Path(norm_path).resolve() == Path(clean_pat).resolve():
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def _walk_tree_postorder(
+        self,
+        root_path: str,
+        exclude_dir_predicate: Optional[Callable[[str], bool]] = None,
+        on_dir_excluded: Optional[Callable[[str], None]] = None,
+    ) -> Iterator[Tuple[str, List[os.DirEntry], List[str]]]:
         """
         Iterative post-order traversal using os.scandir.
         Yields (current_dir, [file_DirEntries], [child_dir_paths]).
         Ensures children are visited and evaluated before their parent directory.
+        Allows pruning subdirectories if exclude_dir_predicate matches.
         """
         stack: List[Tuple[str, int]] = [(root_path, 0)]
         cached_dirs: Dict[str, List[str]] = {}
@@ -351,6 +420,10 @@ class StorageAuditor:
                         for entry in it:
                             try:
                                 if entry.is_dir(follow_symlinks=False):
+                                    if exclude_dir_predicate and exclude_dir_predicate(entry.path):
+                                        if on_dir_excluded:
+                                            on_dir_excluded(entry.path)
+                                        continue
                                     subdirs.append(entry.path)
                                 elif entry.is_file(follow_symlinks=False):
                                     files.append(entry)
@@ -382,7 +455,11 @@ class StorageAuditor:
         except OSError as e:
             self.scan_errors.append(f"Cannot stat downloads root: {e}")
 
-        for dirpath, file_entries, _ in self._walk_tree_postorder(self.downloads_dir):
+        for dirpath, file_entries, _ in self._walk_tree_postorder(
+            self.downloads_dir,
+            exclude_dir_predicate=self._is_download_dir_excluded,
+            on_dir_excluded=self.skipped_download_dirs.append,
+        ):
             for entry in file_entries:
                 try:
                     stat_res = entry.stat(follow_symlinks=False)
@@ -1177,6 +1254,8 @@ class StorageAuditor:
                 "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "downloads_path": self.downloads_dir,
                 "library_paths": self.library_dirs,
+                "exclude_downloads": self.exclude_downloads,
+                "skipped_download_dirs": self.skipped_download_dirs,
                 "payload_threshold_bytes": self.payload_threshold,
                 "verbose_mode": self.verbose,
             },
@@ -1187,6 +1266,7 @@ class StorageAuditor:
                 "downloads_file_count": self.downloads_file_count,
                 "downloads_total_bytes": self.downloads_total_bytes,
                 "downloads_size_human": format_bytes(self.downloads_total_bytes),
+                "skipped_download_dirs_count": len(self.skipped_download_dirs),
                 "library_file_count": self.library_file_count,
                 "library_total_bytes": self.library_total_bytes,
                 "library_size_human": format_bytes(self.library_total_bytes),
@@ -1267,6 +1347,9 @@ class TerminalReporter:
         print(f" {P.c('Staging / Downloads:', P.BOLD)} {self.auditor.downloads_dir}")
         for idx, lib in enumerate(self.auditor.library_dirs, 1):
             print(f" {P.c(f'Organized Library #{idx}:', P.BOLD)} {lib}")
+        if self.auditor.exclude_downloads:
+            pats = ", ".join(f"'{p}'" for p in self.auditor.exclude_downloads)
+            print(f" {P.c('Excluded Subdirs:', P.BOLD)} {pats} ({len(self.auditor.skipped_download_dirs)} pruned)")
         print()
 
     def _print_mergerfs_safety(self) -> None:
@@ -1308,6 +1391,9 @@ class TerminalReporter:
         print(P.c("┌── [1] AUDIT SUMMARY & METRICS " + "─" * 49, P.CYAN))
         print(f"│ Total Files Audited:      {P.c(str(self.auditor.total_scanned_files), P.BOLD)} ({format_bytes(self.auditor.total_scanned_bytes)})")
         print(f"│ Downloads Staging Files:  {self.auditor.downloads_file_count} ({format_bytes(self.auditor.downloads_total_bytes)})")
+        if self.auditor.skipped_download_dirs:
+            pats_str = ", ".join(f"'{p}'" for p in self.auditor.exclude_downloads)
+            print(f"│ Excluded Download Dirs:   {P.c(str(len(self.auditor.skipped_download_dirs)), P.CYAN)} skipped ({pats_str})")
         print(f"│ Organized Library Files:  {self.auditor.library_file_count} ({format_bytes(self.auditor.library_total_bytes)})")
         print(f"│ Distinct Inode Keys:      {len(self.auditor.inode_map)}")
         print("│")
@@ -1590,6 +1676,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="One or more paths to organized media / dataset library trees.",
     )
     parser.add_argument(
+        "-x",
+        "--exclude-downloads",
+        "--exclude-download-dirs",
+        "--ignore-downloads",
+        dest="exclude_downloads",
+        action="extend",
+        nargs="+",
+        default=[],
+        help=(
+            "Subdirectories or glob patterns within the staging/downloads directory to "
+            "blacklist/exclude (e.g. 'incomplete', 'temp', 'torrents/temp', '*single*'). "
+            "Prunes matching directories from traversal."
+        ),
+    )
+    parser.add_argument(
         "-o",
         "--output-json",
         dest="output_json",
@@ -1638,6 +1739,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     auditor = StorageAuditor(
         downloads_dir=args.downloads,
         library_dirs=args.libraries,
+        exclude_downloads=args.exclude_downloads,
         payload_threshold_bytes=payload_threshold_bytes,
         verbose=args.verbose,
     )

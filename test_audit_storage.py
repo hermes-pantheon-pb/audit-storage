@@ -457,6 +457,18 @@ class TestAuditStorage(unittest.TestCase):
         """Tests that dedicated, categorized report files are generated for each anomaly flag."""
         from audit_storage import StorageAuditor
 
+        # Add cross-seeded files across two download directories to exercise top_cross_seed_folders formatting
+        cs_dir_a = self.downloads_dir / "tracker_a"
+        cs_dir_b = self.downloads_dir / "tracker_b"
+        cs_dir_a.mkdir(parents=True, exist_ok=True)
+        cs_dir_b.mkdir(parents=True, exist_ok=True)
+        cs_file_a = cs_dir_a / "cross_seeded_movie.mkv"
+        cs_file_a.write_bytes(b"X" * 1024 * 512)
+        cs_file_b = cs_dir_b / "cross_seeded_movie.mkv"
+        os.link(cs_file_a, cs_file_b)
+        cs_lib = self.movies_dir / "CrossSeededMovie.mkv"
+        os.link(cs_file_a, cs_lib)
+
         auditor = StorageAuditor(
             downloads_dir=str(self.downloads_dir),
             library_dirs=[str(self.tv_dir), str(self.movies_dir), str(self.music_dir), str(self.datasets_dir)],
@@ -499,6 +511,12 @@ class TestAuditStorage(unittest.TestCase):
         # Check content of tv_sequence_gaps.txt
         tv_txt = (export_dir / "tv_sequence_gaps.txt").read_text(encoding="utf-8")
         self.assertIn("E03", tv_txt)
+
+        # Check content of over_linked_files.txt
+        over_txt = (export_dir / "over_linked_files.txt").read_text(encoding="utf-8")
+        self.assertIn("TOP CROSS-SEED FOLDERS", over_txt)
+        self.assertIn("tracker_a", over_txt)
+        self.assertIn("tracker_b", over_txt)
 
         # Test CLI invocation with --output-dir
         cli_export_dir = self.root / "cli_splits"

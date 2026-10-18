@@ -1441,7 +1441,10 @@ class StorageAuditor:
                 if self.overlink_inference.top_cross_seed_folders:
                     f.write("# TOP CROSS-SEED FOLDERS:\n")
                     for pair in self.overlink_inference.top_cross_seed_folders[:5]:
-                        f.write(f"#   - {pair['folders']}: {pair['count']} shared files\n")
+                        fa = pair.get("folder_a", "")
+                        fb = pair.get("folder_b", "")
+                        cnt = pair.get("shared_inodes", pair.get("count", 0))
+                        f.write(f"#   - '{fa}' <-> '{fb}': {cnt} shared files\n")
                 f.write("\n")
             for g in self.over_linked_groups:
                 f.write(f"# Inode {g.ino} (dev={g.dev}, nlink={g.st_nlink}, size={format_bytes(g.size)}, cause={g.inferred_cause})\n")
